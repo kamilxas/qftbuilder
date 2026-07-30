@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qft-builder"
+version = "0.1.0"
+description = "CNOT-efficient QFT circuits for arbitrary qubit connectivity graphs via shortest dominating walks"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Kamil Khasanov", email = "kamilxa200804@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+neural = ["torch>=2.0", "torch-geometric>=2.4"]
+quantum = ["qiskit>=1.0"]
+exact = ["ortools>=9.8"]
+all = ["qft-builder[neural,quantum,exact]"]
+
+[project.urls]
+Repository = "https://github.com/kamilxas/qftbuilder"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+qftbuilder = ["checkpoints/*.pt"]
