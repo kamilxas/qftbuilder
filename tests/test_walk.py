@@ -126,3 +126,44 @@ def test_repair_walk_after_vertex_removal():
         r = repair_walk(w, H)
         assert r is not None
         assert walk_valid(H, r) and covers(H, r)
+
+
+# -- endpoint-constrained search --------------------------------------------
+
+
+@pytest.mark.parametrize("name", list(BENCH))
+def test_walk_ending_at_respects_the_endpoint(name):
+    """The QFT cascade finalizes the qubit its carrier lands on, so a walk can
+    be required to finish somewhere specific."""
+    from qftbuilder.walk import walk_ending_at
+
+    G = BENCH[name]
+    for end in list(G.nodes())[:4]:
+        w = walk_ending_at(G, end)
+        assert w is not None, (name, end)
+        assert w[-1] == end
+        assert walk_valid(G, w) and covers(G, w)
+
+
+def test_pinned_order_keeps_the_last_anchor():
+    """_optimize_order(pin_last=True) may reorder everything except the tail."""
+    from qftbuilder.walk import _optimize_order
+
+    G = BENCH["grid_5x5"]
+    ess = [0, 6, 12, 18, 24, 7]
+    out = _optimize_order(ess, G, pin_last=True)
+    assert out[-1] == ess[-1]
+    assert sorted(out) == sorted(ess)
+
+
+def test_redundancy_removal_can_protect_the_end():
+    """keep_last stops the trimmer from eating the endpoint the caller needs."""
+    from qftbuilder.walk import _redundancy_removal
+
+    G = BENCH["lnn_16"]
+    full = set(G.nodes())
+    walk = list(range(16))
+    trimmed = _redundancy_removal(walk, G, full)
+    kept = _redundancy_removal(walk, G, full, keep_last=True)
+    assert kept[-1] == 15
+    assert covers(G, trimmed) and covers(G, kept)

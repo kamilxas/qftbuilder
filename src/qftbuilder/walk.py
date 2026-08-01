@@ -29,6 +29,7 @@ __all__ = [
     "improve_walk",
     "improve_walk_strong",
     "dominating_walk",
+    "walk_ending_at",
     "repair_walk",
 ]
 
@@ -109,8 +110,13 @@ def complete_walk(walk: List[int], G) -> List[int]:
 # -- local search ------------------------------------------------------------
 
 
-def _redundancy_removal(walk: List[int], G, full: set) -> List[int]:
-    """Splice out interior vertices and trim ends while coverage survives."""
+def _redundancy_removal(walk: List[int], G, full: set,
+                        keep_last: bool = False) -> List[int]:
+    """Splice out interior vertices and trim ends while coverage survives.
+
+    ``keep_last`` protects the final vertex: callers that need the walk to end
+    somewhere specific (the QFT cascade must finish on the qubit it finalizes)
+    would otherwise have the endpoint trimmed away here."""
     walk = list(walk)
     changed = True
     while changed:
@@ -128,7 +134,7 @@ def _redundancy_removal(walk: List[int], G, full: set) -> List[int]:
         while len(walk) > 1 and full <= coverage(walk[1:], G):
             walk = walk[1:]
             changed = True
-        while len(walk) > 1 and full <= coverage(walk[:-1], G):
+        while (not keep_last) and len(walk) > 1 and full <= coverage(walk[:-1], G):
             walk = walk[:-1]
             changed = True
     return walk
@@ -286,11 +292,17 @@ def _walk_key(walk: Optional[List[int]], G, objective: str,
     return (float(len(walk)), float(c))
 
 
-def _optimize_order(ess: List[int], G, weight: Optional[str] = None) -> List[int]:
+def _optimize_order(ess: List[int], G, weight: Optional[str] = None,
+                    pin_last: bool = False) -> List[int]:
     """2-opt + Or-opt (segment relocation, both orientations) over the order
     of essential vertices in the shortest-path metric (Dijkstra when
     ``weight`` is given). Coverage is invariant to order, so only the tour
-    cost is minimized."""
+    cost is minimized.
+
+    ``pin_last`` forbids every move that would displace the final anchor, so
+    the order still ends where the caller demands while the rest is optimized
+    against it (the transition into the pinned vertex stays part of the cost --
+    optimizing the prefix alone would ignore it)."""
     if len(ess) < 4:
         return ess
     uniq = list(dict.fromkeys(ess))
@@ -312,8 +324,9 @@ def _optimize_order(ess: List[int], G, weight: Optional[str] = None) -> List[int
         improved = False
         guard += 1
         L = len(best)
+        last = L - 1 if pin_last else L      # 2-opt may not touch a pinned tail
         for i in range(0, L - 1):
-            for j in range(i + 1, L):
+            for j in range(i + 1, last):
                 # 2-opt reverses best[i:j+1]; only the two boundary edges
                 # change (interior edges reverse but the metric is symmetric),
                 # so the length delta is O(1). Distances are integers, so this
@@ -338,12 +351,15 @@ def _optimize_order(ess: List[int], G, weight: Optional[str] = None) -> List[int
             for seg in (1, 2, 3, 4):
                 if seg >= L:
                     break
-                for i in range(0, L - seg + 1):
+                # a pinned tail may neither be relocated nor overtaken
+                span = L - seg + (0 if pin_last else 1)
+                for i in range(0, span):
                     segment = best[i:i + seg]
                     rest = best[:i] + best[i + seg:]
                     orients = (segment,) if seg == 1 else (segment, segment[::-1])
+                    slots = len(rest) + (0 if pin_last else 1)
                     for piece in orients:
-                        for k in range(0, len(rest) + 1):
+                        for k in range(0, slots):
                             cand = rest[:k] + piece + rest[k:]
                             if cand == best:
                                 continue
@@ -538,6 +554,49 @@ def dominating_walk(G, lam_grid=(0.0, 0.5, 1.0), restarts: int = 4,
                 if best_key is None or kw < best_key:
                     best_walk, best_key = w, kw
     return best_walk
+
+
+def walk_ending_at(G, end, base: Optional[List[int]] = None,
+                   objective: str = "cnot", weight: Optional[str] = None,
+                   rounds: int = 4) -> Optional[List[int]]:
+    """Best dominating walk of ``G`` that **finishes at** ``end``.
+
+    The QFT cascade finalizes the qubit its carrier lands on, so the endpoint
+    is a real constraint rather than a by-product. Repairing a finished walk
+    (reverse it, or route to the nearest legal vertex) costs one extra CNOT per
+    added step; searching under the constraint instead lets the anchor order
+    account for the endpoint from the start.
+
+    Returns None if no covering walk ending at ``end`` was found."""
+    full = set(G.nodes())
+    if len(full) == 1:
+        return [end]
+    if base is None:
+        base = dominating_walk(G, objective=objective, weight=weight)
+    if not base:
+        return None
+    if objective == "fidelity" and weight is None:
+        weight = EDGE_WEIGHT
+
+    cands: List[List[int]] = []
+    for w in (base, base[::-1]):            # free if an endpoint already fits
+        if w and w[-1] == end and covers(G, w):
+            cands.append(list(w))
+
+    ess = _essential_seq(base, G)
+    ess = [v for v in ess if v != end] + [end]
+    order = _optimize_order(ess, G, weight, pin_last=True)
+    for stitch in (_expand_order_rich, _expand_order):
+        w = stitch(order, G, weight)
+        if w is None or w[-1] != end:
+            continue
+        w = _redundancy_removal(w, G, full, keep_last=True)
+        if w and w[-1] == end and walk_valid(G, w) and (full <= coverage(w, G)):
+            cands.append(w)
+
+    if not cands:
+        return None
+    return min(cands, key=lambda w: _walk_key(w, G, objective, weight=weight))
 
 
 # -- warm-start repair -------------------------------------------------------

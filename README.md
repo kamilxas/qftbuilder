@@ -194,7 +194,7 @@ dual bound remains available as an independent certificate.
 
 ## Project layout
 
-`src/qftbuilder/` library · `tests/` (180 tests incl. brute-force equivalence,
+`src/qftbuilder/` library · `tests/` (192 tests incl. brute-force equivalence,
 pruned-vs-unpruned search and the runtime-budget contract) ·
 [`docs/proofs.md`](docs/proofs.md) correctness proofs for every
 optimality-critical shortcut · `examples/quickstart.py`.
