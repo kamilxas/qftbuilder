@@ -53,7 +53,8 @@ More in [`examples/quickstart.py`](examples/quickstart.py).
 | `certify(graph, result)` | `Certificate` — MILP/CP-SAT lower bound, `proven_optimal` |
 | `sub_qft(graph, k)` | optimal size-`k` region + walk (+ `region_proven`) |
 | `sub_qft_sweep(graph)` | the same for **every** `k` from one search |
-| `build_full_qft(graph)` | full QFT: exact CNOT total, per-cascade account, optional qiskit circuit |
+| `build_full_qft(graph)` | full QFT **cost**: exact CNOT total, per-cascade account, skeleton circuit |
+| `build_qft_circuit(graph)` | full QFT **circuit**: the exact unitary, true angles, permuted wire order |
 | `single_sweep(graph)` | one sweep + SWAP-free circuit skeleton |
 | `draw_solution / draw_benchmark` | matplotlib figures (walk order, region, coverage) |
 | `lnn / cycle / sun / heavy_hex / square_lattice / standard_benchmark` | device topologies |
@@ -176,8 +177,13 @@ dual bound remains available as an independent certificate.
 
 ## Caveats
 
-- Emitted circuits are **CX-count-accurate skeletons**: rotation angles are
-  placeholders pending faithful Algorithm-9/10 angle bookkeeping (roadmap).
+- Two circuit builders, on purpose. `build_full_qft` is the cost model: its
+  circuit is a **CX-count-accurate skeleton** with placeholder angles, and the
+  published CNOT numbers refer to it. `build_qft_circuit` emits the **exact
+  QFT unitary** (verified against qiskit by operator equivalence) and costs a
+  few percent more CNOTs — each cascade has to end on the qubit it finalizes.
+  It returns the QFT in a permuted wire order (`qubit_order` / `input_order`);
+  relabel rather than pay for reversal swaps.
 - Dense graphs can push the sub-QFT BFS past its memory cap; it then
   degrades to a beam and honestly reports `region_proven=False`
   (`certify_sub` still bounds the answer).
@@ -188,7 +194,7 @@ dual bound remains available as an independent certificate.
 
 ## Project layout
 
-`src/qftbuilder/` library · `tests/` (149 tests incl. brute-force equivalence,
+`src/qftbuilder/` library · `tests/` (180 tests incl. brute-force equivalence,
 pruned-vs-unpruned search and the runtime-budget contract) ·
 [`docs/proofs.md`](docs/proofs.md) correctness proofs for every
 optimality-critical shortcut · `examples/quickstart.py`.

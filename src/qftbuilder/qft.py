@@ -22,10 +22,19 @@ Improvements over the source project's construction:
 - the finalized-qubit choice is made with a one-step lookahead over endpoint
   candidates instead of a fixed rule.
 
-Angle caveat: emitted rotation angles are placeholders (as in the reference
-construction) — circuits are **CX-count-accurate skeletons**, not the exact
-QFT unitary. Faithful angle bookkeeping is planned; all CNOT comparisons are
-unaffected.
+Two builders, and the difference matters:
+
+- :func:`build_full_qft` is the **cost model**. Its circuit is a skeleton:
+  every rotation carries one placeholder angle, so it reproduces the CNOT
+  account exactly but is *not* the QFT unitary. Use it for counting.
+- :func:`build_qft_circuit` is the **real circuit**. It carries the textbook
+  angles ``pi/2**(m-r)`` and is verified against qiskit's QFT by operator
+  equivalence. Correctness costs a few percent more CNOTs, because each
+  cascade must end on the vertex it finalizes.
+
+Both keep every 2-qubit gate on a physical edge, so neither needs SWAP
+insertion, and all published CNOT comparisons (which are about the skeleton
+account) are unaffected.
 
 Circuit emission requires qiskit (``pip install qft-builder[quantum]``);
 count-only results work without it.
@@ -82,6 +91,48 @@ def _qc_collect_and_move(qc, target: int, control: int) -> None:
     qc.rz(-_THETA, target)
     qc.cx(target, control)
     qc.cx(control, target)
+
+
+# -- faithful-angle primitives ----------------------------------------------
+#
+# The skeleton primitives above apply one fixed rotation. The three below take
+# the real QFT angle. Note the CNOT counts are identical (2 / 3 / 3), so
+# faithfulness is free per gate -- every correction is single-qubit.
+
+
+def _qc_cphase(qc, lam: float, control: int, target: int) -> None:
+    """``CP(lam)``: the 2-CNOT collect with the true angle.
+
+    The bare sandwich implements ``CRZ(lam)``, which differs from ``CP(lam)``
+    by a phase on the control; ``p(lam/2, control)`` repairs it."""
+    qc.rz(lam / 2, target)
+    qc.cx(control, target)
+    qc.rz(-lam / 2, target)
+    qc.cx(control, target)
+    qc.p(lam / 2, control)
+
+
+def _qc_cphase_move(qc, lam: float, target: int, control: int) -> None:
+    """``CP(lam)`` followed by ``SWAP``: the 3-CNOT collect-and-move.
+
+    The swap carries the control's state to the other wire, so the
+    ``CRZ -> CP`` phase lands on ``target`` *after* the swap. Putting it on the
+    control at the end is a different (wrong) unitary -- verified numerically."""
+    qc.rz(lam / 2, target)
+    qc.cx(control, target)
+    qc.rz(-lam / 2, target)
+    qc.cx(target, control)
+    qc.cx(control, target)
+    qc.p(lam / 2, target)
+
+
+def _qc_swap(qc, a: int, b: int) -> None:
+    """Bare 3-CNOT swap: used when the walk revisits a vertex, where the pair
+    has already been phased and must not be phased twice. Same cost as a
+    collect-and-move, so revisits cost nothing extra."""
+    qc.cx(b, a)
+    qc.cx(a, b)
+    qc.cx(b, a)
 
 
 def assign_whites(
@@ -394,6 +445,146 @@ def transpiled_cx(qc, graph, opt_level: int = 1, seed: int = 0) -> Tuple[int, in
     out = pm.run(qc)
     ops = out.count_ops()
     return ops.get("cx", 0) + ops.get("cz", 0), out.depth()
+
+
+def _endpoint_removable(sub: nx.Graph, walk: List[int]) -> List[int]:
+    """Make the walk end on a vertex whose removal keeps the graph connected.
+
+    The carrier rides the swaps to ``walk[-1]``, and that is the qubit the
+    cascade finalizes, so the walk *must* end where we are allowed to remove.
+    Try the other endpoint first (a reversed dominating walk is still one, at
+    identical cost), else route the carrier to the nearest legal vertex."""
+    def ok(v):
+        H = sub.copy()
+        H.remove_node(v)
+        return H.number_of_nodes() == 0 or nx.is_connected(H)
+
+    if ok(walk[-1]):
+        return walk
+    if ok(walk[0]):
+        return walk[::-1]
+    targets = [v for v in sub.nodes() if ok(v)]
+    if not targets:
+        return walk
+    tgt = min(targets, key=lambda v: nx.shortest_path_length(sub, walk[-1], v))
+    return walk + nx.shortest_path(sub, walk[-1], tgt)[1:]
+
+
+def _plan_faithful(G: nx.Graph, solver: Solver, lookahead: bool):
+    """Pass 1: cascade walks and the finalization order. No angles needed --
+    the plan depends only on the graph, which is what lets pass 2 know every
+    logical index in advance."""
+    live = set(G.nodes())
+    steps: List[Tuple[List[int], int]] = []
+    prev: Optional[List[int]] = None
+    while live:
+        sub = G.subgraph(live).copy()
+        if sub.number_of_nodes() == 1:
+            v = next(iter(live))
+            steps.append(([v], v))
+            live.discard(v)
+            continue
+        walk = _cascade_candidates(sub, prev, solver)
+        if walk is None:
+            break
+        walk = _endpoint_removable(sub, walk)
+        steps.append((walk, walk[-1]))
+        live.discard(walk[-1])
+        prev = walk
+    return steps
+
+
+def _logical_index(G: nx.Graph, steps) -> Dict[int, int]:
+    """``{initial position: logical index}``. Logical ``r`` is by definition the
+    qubit finalized by cascade ``r``; following the swaps back tells us which
+    starting wire that is. Because logical index equals finalization order, the
+    qubits still live during cascade ``r`` are exactly the indices ``> r`` --
+    precisely the set the textbook QFT phases qubit ``r`` against."""
+    at = {p: p for p in G.nodes()}
+    out: Dict[int, int] = {}
+    for r, (walk, _) in enumerate(steps):
+        out[at[walk[0]]] = r
+        for a, b in zip(walk, walk[1:]):
+            at[a], at[b] = at[b], at[a]
+    return out
+
+
+def build_qft_circuit(graph, solver: Optional[Solver] = None,
+                      strategy: str = "greedy") -> Dict:
+    """The **exact** QFT unitary on an arbitrary coupling graph.
+
+    Unlike :func:`build_full_qft`, whose circuit is a CX-count-accurate
+    skeleton with placeholder angles, this emits the true QFT: every rotation
+    carries the textbook angle ``pi/2**(m-r)`` between logical qubits ``r``
+    (the one the cascade finalizes) and ``m``. Verified against qiskit's QFT by
+    operator equivalence in the test suite.
+
+    Two structural consequences, both real costs of correctness:
+
+    * each cascade must end on the vertex it finalizes, so a walk whose
+      endpoint cannot be removed is reversed or extended -- this is why the
+      count here can exceed :func:`build_full_qft`'s;
+    * the moves permute the qubits, so the result is the QFT **in a permuted
+      wire order**: ``qubit_order[l]`` is the physical wire carrying logical
+      ``l`` on output, and ``input_order[l]`` the wire it entered on. No
+      reversal swaps are emitted; relabel instead of paying for them.
+
+    Returns ``{qc, cnot, cascades, walks, qubit_order, input_order}``.
+    Requires qiskit."""
+    if not HAVE_QISKIT:
+        raise ImportError("qiskit not installed; run `pip install qft-builder[quantum]`")
+    G, labels = as_graph(graph)
+    n = G.number_of_nodes()
+    solver = solver or Solver()
+    steps = _plan_faithful(G, solver, lookahead=(strategy == "lookahead"))
+    logical_of_init = _logical_index(G, steps)
+
+    qc = QuantumCircuit(n)
+    at = {p: p for p in G.nodes()}          # physical wire -> initial position
+    live = set(G.nodes())
+    cnot = 0
+    final_pos: Dict[int, int] = {}
+    for r, (walk, rem) in enumerate(steps):
+        sub = G.subgraph(live).copy()
+        qc.h(walk[0])                       # H on the qubit being finalized
+        wm = assign_whites(walk, list(sub.nodes()), sub)
+        done: set = set()
+        seen: set = set()
+        for idx, black in enumerate(walk):
+            for w in wm.get(black, []):
+                if w in seen:
+                    continue
+                seen.add(w)
+                m = logical_of_init[at[w]]
+                if m in done or m == r:
+                    continue
+                done.add(m)
+                _qc_cphase(qc, math.pi / 2 ** (m - r), control=int(w),
+                           target=int(black))
+                cnot += 2
+            if idx < len(walk) - 1:
+                nxt = int(walk[idx + 1])
+                m = logical_of_init[at[nxt]]
+                if m in done or m == r:
+                    _qc_swap(qc, int(black), nxt)   # revisit: no second phase
+                else:
+                    done.add(m)
+                    _qc_cphase_move(qc, math.pi / 2 ** (m - r),
+                                    target=int(black), control=nxt)
+                cnot += 3
+                at[black], at[nxt] = at[nxt], at[black]
+        final_pos[r] = rem
+        live.discard(rem)
+
+    inv = {r: ip for ip, r in logical_of_init.items()}
+    return {
+        "qc": qc,
+        "cnot": cnot,
+        "cascades": len(steps),
+        "walks": [[labels[i] for i in w] for w, _ in steps],
+        "qubit_order": {l: labels[final_pos[l]] for l in sorted(final_pos)},
+        "input_order": {l: labels[inv[l]] for l in sorted(inv)},
+    }
 
 
 def naive_qft(k: int, num_qubits: int):

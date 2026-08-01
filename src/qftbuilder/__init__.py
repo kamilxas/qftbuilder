@@ -34,7 +34,14 @@ from .graphs import (
     with_edge_errors,
 )
 from .kwalk import budgeted_sweep, budgeted_walk, max_coverage_walk
-from .qft import build_full_qft, naive_qft, single_sweep, sub_qft, transpiled_cx
+from .qft import (
+    build_full_qft,
+    build_qft_circuit,
+    naive_qft,
+    single_sweep,
+    sub_qft,
+    transpiled_cx,
+)
 from .solver import Certificate, Solver, SolveResult
 from .viz import draw_benchmark, draw_solution, grid_layout
 
@@ -85,7 +92,8 @@ __all__ = [
     "sub_qft", "sub_qft_sweep", "budgeted_walk", "budgeted_sweep",
     "max_coverage_walk",
     # circuits
-    "single_sweep", "build_full_qft", "transpiled_cx", "naive_qft",
+    "single_sweep", "build_full_qft", "build_qft_circuit",
+    "transpiled_cx", "naive_qft",
     # cost model
     "cnot_upper_bound", "cnot_hp_exact", "sweep_cost", "walk_cost",
     # fidelity-aware account
