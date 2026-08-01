@@ -29,8 +29,9 @@ Two builders, and the difference matters:
   account exactly but is *not* the QFT unitary. Use it for counting.
 - :func:`build_qft_circuit` is the **real circuit**. It carries the textbook
   angles ``pi/2**(m-r)`` and is verified against qiskit's QFT by operator
-  equivalence. Correctness costs a few percent more CNOTs, because each
-  cascade must end on the vertex it finalizes.
+  equivalence. Correctness costs ~5% more CNOTs against the same planner:
+  each cascade must end on the vertex it finalizes, and a walk that does not
+  needs exactly one extra step (a 2-CNOT white becomes a 3-CNOT move).
 
 Both keep every 2-qubit gate on a physical edge, so neither needs SWAP
 insertion, and all published CNOT comparisons (which are about the skeleton
