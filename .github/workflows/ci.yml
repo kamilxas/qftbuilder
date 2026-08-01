@@ -1,0 +1,57 @@
+name: tests
+
+# Why this exists: the suite has only ever run on the author's machine
+# (Windows, Python 3.14, every optional package installed), while the package
+# claims requires-python >= 3.10 and that torch/qiskit/ortools are optional.
+# This checks both claims on clean machines. The weekly run is the point of a
+# scheduled job: breakage usually arrives from a dependency release, not from
+# a commit here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  core:
+    name: py${{ matrix.python }} (core deps only)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install without any optional extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+      - name: Optional dependencies must really be optional
+        run: |
+          python -c "import qftbuilder as qb; G = qb.heavy_hex(2, 2); \
+                     print('solve', len(qb.solve(G).walk)); \
+                     print('sub_qft', qb.sub_qft(G, k=8)['k_path'])"
+      - run: pytest -q
+
+  full:
+    name: py3.12 (all extras)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with torch / qiskit / ortools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[all]"
+          pip install pytest
+      - run: pytest -q

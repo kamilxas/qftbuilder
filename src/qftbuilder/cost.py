@@ -21,6 +21,7 @@ Two levels of accounting:
 """
 from __future__ import annotations
 
+import math
 from typing import Optional, Sequence
 
 __all__ = [
@@ -28,7 +29,19 @@ __all__ = [
     "cnot_hp_exact",
     "sweep_cost",
     "walk_cost",
+    "EDGE_WEIGHT",
+    "error_to_weight",
+    "weighted_sweep_cost",
 ]
+
+#: Edge attribute holding the per-CNOT cost of a coupling. Absent attributes
+#: read as 1.0, which reproduces the unweighted account exactly
+#: (docs/proofs.md, Proposition 5.1).
+EDGE_WEIGHT = "cnot_weight"
+
+#: Smallest weight a coupling may carry. A zero weight is legal but blinds the
+#: budgeted search's heuristic (docs/proofs.md, Lemma 5.4, degenerate case).
+WEIGHT_FLOOR = 1e-9
 
 
 def cnot_upper_bound(k: int, n: int) -> int:
@@ -65,3 +78,55 @@ def walk_cost(walk: Optional[Sequence[int]], region_size: int) -> Optional[int]:
     if walk is None:
         return None
     return sweep_cost(len(walk), len(set(walk)), region_size)
+
+
+# -- fidelity-aware account --------------------------------------------------
+
+
+def error_to_weight(err: float, floor: float = WEIGHT_FLOOR) -> float:
+    """Turn a CNOT error rate into an additive weight ``-ln(1 - err)``, so that
+    summing weights along a circuit equals ``-ln`` of the product of survival
+    probabilities. Clamped to ``[floor, ...)``; ``err >= 1`` maps to a large
+    finite penalty rather than infinity so the search stays well defined."""
+    e = min(max(float(err), 0.0), 1.0 - 1e-12)
+    return max(-math.log1p(-e), floor)
+
+
+def _edge_w(G, u, v, weight: str, default: float) -> float:
+    data = G.get_edge_data(u, v) or {}
+    return float(data.get(weight, default))
+
+
+def weighted_sweep_cost(walk, G, region=None, weight: str = EDGE_WEIGHT,
+                        default: float = 1.0) -> float:
+    """Fidelity-aware cost of one sweep (docs/proofs.md, section 5)::
+
+        3 * sum over moves of w(edge)  +  2 * sum over whites of the cheapest
+        edge to a black neighbour.
+
+    ``region`` defaults to everything the walk covers. With every weight equal
+    to 1 this returns exactly ``sweep_cost`` (Proposition 5.1); the white
+    assignment is optimal by Proposition 5.2."""
+    if not walk:
+        return 0.0
+    blacks = set(walk)
+    total = 0.0
+    for a, b in zip(walk, walk[1:]):
+        total += 3.0 * _edge_w(G, a, b, weight, default)
+    if region is None:
+        region = set()
+        for v in walk:
+            region.add(v)
+            region.update(G.neighbors(v))
+    for x in region:
+        if x in blacks:
+            continue
+        best = None
+        for b in G.neighbors(x):
+            if b in blacks:
+                cw = _edge_w(G, b, x, weight, default)
+                if best is None or cw < best:
+                    best = cw
+        if best is not None:
+            total += 2.0 * best
+    return total

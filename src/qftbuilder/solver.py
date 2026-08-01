@@ -31,7 +31,13 @@ import networkx as nx
 from .cds import cds_dfs_path
 from .cost import cnot_upper_bound, walk_cost
 from .graphs import as_graph
-from .walk import covers, dominating_walk, improve_walk_strong, walk_valid
+from .walk import (
+    _walk_key,
+    covers,
+    dominating_walk,
+    improve_walk_strong,
+    walk_valid,
+)
 
 __all__ = ["Solver", "SolveResult", "Certificate"]
 
@@ -46,7 +52,7 @@ class SolveResult:
     source: str
     length: int                      # walk vertices, repeats counted
     distinct: int                    # distinct walk vertices
-    cost: int                        # exact one-sweep CNOTs (2g + 3m)
+    cost: int                        # exact one-sweep CNOTs (2w + 3m, w = whites)
     cost_bound: int                  # Theorem-4 bound 3*len*n - 2*n
     candidates: Dict[str, Dict]      # per-rung {length, distinct, cost}
     n: int
@@ -87,8 +93,10 @@ class Solver:
     profile : ``"fast" | "balanced" | "max"``
         Rung set (see module docstring). ``balanced`` is the default and uses
         the bundled neural checkpoints when torch is available.
-    objective : ``"cnot" | "length"``
-        Candidate ranking: exact one-sweep CNOT cost (default) or raw length.
+    objective : ``"cnot" | "length" | "fidelity"``
+        Candidate ranking: exact one-sweep CNOT cost (default), raw length,
+        or the per-edge-error-weighted account (docs/proofs.md section 5,
+        weights from :func:`qftbuilder.graphs.with_edge_errors`).
     cpsat_time : float
         Time budget for the ``max`` profile's exact polish, seconds.
     """
@@ -109,7 +117,7 @@ class Solver:
     ) -> None:
         if profile not in ("fast", "balanced", "max"):
             raise ValueError(f"unknown profile: {profile!r}")
-        if objective not in ("cnot", "length"):
+        if objective not in ("cnot", "length", "fidelity"):
             raise ValueError(f"unknown objective: {objective!r}")
         self.profile = profile
         self.objective = objective
@@ -154,8 +162,11 @@ class Solver:
     # -- rungs --------------------------------------------------------------
 
     def _ls(self, walk, G):
+        # The local search runs under the *same* objective the selector ranks
+        # by, so a candidate is not shortened into a costlier walk on the way
+        # to being scored (docs/proofs.md, Corollary 3.3).
         if walk and self.local_search:
-            return improve_walk_strong(walk, G)
+            return improve_walk_strong(walk, G, objective=self.objective)
         return walk
 
     def _rung_whp(self, G: nx.Graph) -> Optional[List[int]]:
@@ -194,13 +205,13 @@ class Solver:
         for raw in cands:
             w = self._ls(raw, G)
             if w and walk_valid(G, w) and covers(G, w):
-                key = self._cost_key(w, n)
+                key = self._cost_key(w, n, G)
                 if best is None or key < best_key:
                     best, best_key = w, key
         return best
 
     def _rung_mcds(self, G: nx.Graph) -> Optional[List[int]]:
-        w = self._ls(dominating_walk(G), G)
+        w = self._ls(dominating_walk(G, objective=self.objective), G)
         if w and walk_valid(G, w) and covers(G, w):
             return w
         return None
@@ -213,7 +224,11 @@ class Solver:
 
     # -- selection ----------------------------------------------------------
 
-    def _cost_key(self, walk: List[int], n: int) -> tuple:
+    def _cost_key(self, walk: List[int], n: int, G: Optional[nx.Graph] = None) -> tuple:
+        if self.objective == "fidelity":
+            if G is None:
+                raise ValueError("fidelity ranking needs the graph")
+            return _walk_key(walk, G, "fidelity", region_size=n)
         cost = walk_cost(walk, n)
         if self.objective == "cnot":
             return (cost, len(walk))
@@ -243,7 +258,7 @@ class Solver:
         # cds_dfs_path always succeeds on a connected graph -> cand non-empty
 
         best_src = min(
-            cand, key=lambda s: (self._cost_key(cand[s], n), _SOURCE_RANK[s])
+            cand, key=lambda s: (self._cost_key(cand[s], n, G), _SOURCE_RANK[s])
         )
 
         if self.profile == "max":
@@ -256,7 +271,8 @@ class Solver:
                 )
                 if (
                     r["walk"] is not None
-                    and self._cost_key(r["walk"], n) < self._cost_key(cand[best_src], n)
+                    and self._cost_key(r["walk"], n, G)
+                    < self._cost_key(cand[best_src], n, G)
                 ):
                     cand["cpsat"] = r["walk"]
                     best_src = "cpsat"

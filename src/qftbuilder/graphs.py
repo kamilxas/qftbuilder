@@ -23,6 +23,8 @@ from typing import Dict, Hashable, List, Tuple
 
 import networkx as nx
 
+from .cost import EDGE_WEIGHT, error_to_weight
+
 __all__ = [
     "as_graph",
     "lnn",
@@ -33,6 +35,7 @@ __all__ = [
     "heavy_hex",
     "square_lattice",
     "standard_benchmark",
+    "with_edge_errors",
 ]
 
 
@@ -97,7 +100,8 @@ def as_graph(obj) -> Tuple[nx.Graph, Dict[int, Hashable]]:
     if isinstance(obj, nx.Graph):
         H = nx.Graph()
         H.add_nodes_from(obj.nodes())
-        H.add_edges_from((u, v) for u, v in obj.edges() if u != v)
+        # keep edge attributes: fidelity weights ride on them
+        H.add_edges_from((u, v, d) for u, v, d in obj.edges(data=True) if u != v)
     elif isinstance(obj, (str, Path)):
         H = _from_file(Path(obj))
     elif isinstance(obj, dict):
@@ -133,7 +137,7 @@ def as_graph(obj) -> Tuple[nx.Graph, Dict[int, Hashable]]:
     inv = {v: i for i, v in labels.items()}
     G = nx.Graph()
     G.add_nodes_from(range(len(order)))
-    G.add_edges_from((inv[u], inv[v]) for u, v in H.edges())
+    G.add_edges_from((inv[u], inv[v], d) for u, v, d in H.edges(data=True))
     return G, labels
 
 
@@ -228,3 +232,48 @@ def standard_benchmark(max_n: int = 60) -> Dict[str, nx.Graph]:
         for name, G in cand.items()
         if G.number_of_nodes() <= max_n and nx.is_connected(G)
     }
+
+
+# -- fidelity weights --------------------------------------------------------
+
+
+def with_edge_errors(graph, errors=None, weight: str = EDGE_WEIGHT,
+                     inplace: bool = False) -> nx.Graph:
+    """Attach per-coupling CNOT error rates as additive weights.
+
+    ``errors`` may be a mapping ``{(u, v): rate}`` (either orientation), a
+    callable ``(u, v) -> rate``, or a single float applied to every edge; the
+    rate is stored as ``-ln(1 - rate)`` under the ``weight`` attribute so that
+    weights add along a circuit (docs/proofs.md, section 5). Edges missing from
+    the mapping keep whatever weight they already have, defaulting to 1.0 at
+    read time -- i.e. an unannotated graph behaves exactly as before.
+
+    Returns the annotated graph (a copy unless ``inplace``)::
+
+        G = qb.with_edge_errors(qb.heavy_hex(2, 2), backend_error_map)
+        res = qb.solve(G, objective="fidelity")
+    """
+    G = graph if inplace else graph.copy()
+    if errors is None:
+        return G
+    if callable(errors):
+        lookup = errors
+    elif isinstance(errors, (int, float)):
+        val = float(errors)
+
+        def lookup(u, v):
+            return val
+    else:
+        table = dict(errors)
+
+        def lookup(u, v):
+            if (u, v) in table:
+                return table[(u, v)]
+            return table.get((v, u))
+
+    for u, v in G.edges():
+        rate = lookup(u, v)
+        if rate is None:
+            continue
+        G[u][v][weight] = error_to_weight(rate)
+    return G

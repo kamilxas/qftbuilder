@@ -8,9 +8,9 @@ routine here either builds a short walk or shortens one without breaking
 coverage.
 
 Provenance: ported from the author's thesis project, where each piece was
-validated against exact solvers. The
-local search is monotone-safe: output is never longer than the input and
-always retains full coverage, else the input is returned unchanged.
+validated against exact solvers. The local search is monotone-safe: output is
+never longer than the input and always retains full coverage, else the input
+is returned unchanged.
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from collections import deque
 from typing import List, Optional, Set
 
 import networkx as nx
+
+from .cost import EDGE_WEIGHT, walk_cost, weighted_sweep_cost
 
 __all__ = [
     "coverage",
@@ -152,8 +154,9 @@ def _essential_seq(walk: List[int], G) -> List[int]:
     return ded
 
 
-def _expand_order(order: List[int], G) -> Optional[List[int]]:
-    """Join vertices in the given order by shortest paths -> a walk."""
+def _expand_order(order: List[int], G,
+                  weight: Optional[str] = None) -> Optional[List[int]]:
+    """Join vertices in the given order by minimum-cost paths -> a walk."""
     if not order:
         return []
     out = [order[0]]
@@ -161,22 +164,142 @@ def _expand_order(order: List[int], G) -> Optional[List[int]]:
         if a == b:
             continue
         try:
-            sp = nx.shortest_path(G, a, b)
+            sp = _one_path(G, a, b, weight)
         except nx.NetworkXNoPath:
             return None
         out.extend(sp[1:])
     return out
 
 
-def _optimize_order(ess: List[int], G) -> List[int]:
+_TOL = 1e-9
+
+
+def _edge_len(G, u, v, weight: Optional[str]) -> float:
+    if weight is None:
+        return 1.0
+    return float(G[u][v].get(weight, 1.0))
+
+
+def _dist_from(G, s, weight: Optional[str]):
+    """Single-source distances in the chosen metric (BFS or Dijkstra)."""
+    if weight is None:
+        return nx.single_source_shortest_path_length(G, s)
+    return nx.single_source_dijkstra_path_length(G, s, weight=weight)
+
+
+def _one_path(G, a, b, weight: Optional[str]) -> List[int]:
+    if weight is None:
+        return nx.shortest_path(G, a, b)
+    return nx.dijkstra_path(G, a, b, weight=weight)
+
+
+def _shortest_path_max_new(G, a, b, used,
+                           weight: Optional[str] = None) -> Optional[List[int]]:
+    """Among all *minimum-cost* ``a -> b`` paths, one maximizing the count of
+    vertices outside ``used`` (the endpoint ``a`` is excluded, the previous
+    segment already contributed it).
+
+    Exact per segment: the minimum-cost paths are exactly the paths of the DAG
+    ``{(v,w) : D(w) + w(v,w) = D(v)}`` for ``D(v) = d(v,b)``, along which the
+    vertex set is additive, so backward DP in order of increasing ``D`` is
+    optimal (docs/proofs.md, Lemma 3.6). Choosing among them never changes the
+    path cost (Lemma 3.4), so this buys distinct (black) vertices for free.
+    With ``weight`` set the same argument runs in the weighted metric
+    (section 5), where ``D`` comes from Dijkstra."""
+    if a == b:
+        return [a]
+    D = _dist_from(G, b, weight)
+    da = D.get(a)
+    if da is None:
+        return None
+    best = {b: (0 if b in used else 1)}
+    choice: dict = {}
+    for v, d in sorted(D.items(), key=lambda kv: kv[1]):
+        if d > da + _TOL:
+            break
+        if v == b:
+            continue
+        bw = None
+        bv = None
+        for w in G.neighbors(v):
+            dw = D.get(w)
+            if dw is None or dw >= d:
+                continue
+            if abs(dw + _edge_len(G, v, w, weight) - d) > _TOL:
+                continue
+            val = best.get(w)
+            if val is not None and (bw is None or val > bw):
+                bw, bv = val, w
+        if bw is None:
+            continue
+        best[v] = bw + (0 if v in used else 1)
+        choice[v] = bv
+    if a not in choice:
+        return None
+    path = [a]
+    cur = a
+    while cur != b:
+        cur = choice[cur]
+        path.append(cur)
+    return path
+
+
+def _expand_order_rich(order: List[int], G,
+                       weight: Optional[str] = None) -> Optional[List[int]]:
+    """``_expand_order`` with distinct-maximizing segment choice. Produces a
+    walk of exactly the same cost as any other minimum-cost stitching of the
+    same order, with at least as many distinct vertices."""
+    if not order:
+        return []
+    out = [order[0]]
+    used = {order[0]}
+    for a, b in zip(order, order[1:]):
+        if a == b:
+            continue
+        sp = _shortest_path_max_new(G, a, b, used, weight)
+        if sp is None:
+            return None
+        out.extend(sp[1:])
+        used.update(sp)
+    return out
+
+
+def _walk_key(walk: Optional[List[int]], G, objective: str,
+              region_size: Optional[int] = None,
+              weight: Optional[str] = None):
+    """Ranking key, smaller is better. ``objective="length"`` ranks by length
+    with the true CNOT cost as tie-break (so equal-length walks with more
+    black vertices win -- free by Corollary 3.2); ``objective="cnot"`` ranks by
+    the exact single-sweep cost ``2*whites + 3*moves`` with length as
+    tie-break; ``objective="fidelity"`` ranks by the weighted account of
+    docs/proofs.md section 5, with the unweighted cost as tie-break."""
+    if not walk:
+        return (float("inf"), float("inf"))
+    s = G.number_of_nodes() if region_size is None else region_size
+    c = walk_cost(walk, s)
+    if objective == "fidelity":
+        wc = weighted_sweep_cost(walk, G, region=set(G.nodes()),
+                                 weight=weight or EDGE_WEIGHT)
+        return (wc, float(c))
+    if objective == "cnot":
+        return (float(c), float(len(walk)))
+    return (float(len(walk)), float(c))
+
+
+def _optimize_order(ess: List[int], G, weight: Optional[str] = None) -> List[int]:
     """2-opt + Or-opt (segment relocation, both orientations) over the order
-    of essential vertices in the shortest-path metric. Coverage is invariant
-    to order, so only the tour length is minimized."""
+    of essential vertices in the shortest-path metric (Dijkstra when
+    ``weight`` is given). Coverage is invariant to order, so only the tour
+    cost is minimized."""
     if len(ess) < 4:
         return ess
     uniq = list(dict.fromkeys(ess))
-    dist = {s: nx.single_source_shortest_path_length(G, s) for s in uniq}
+    dist = {s: _dist_from(G, s, weight) for s in uniq}
     INF = float("inf")
+    # The O(1) 2-opt delta is exact for integer distances (Theorem 1); under
+    # real weights the same delta is used with a tolerance, since "strictly
+    # cheaper" can no longer be read off as "< 0" on floats.
+    eps = 0.0 if weight is None else _TOL
 
     def seglen(seq):
         return sum(dist[a].get(b, INF) for a, b in zip(seq, seq[1:]))
@@ -204,7 +327,7 @@ def _optimize_order(ess: List[int], G) -> List[int]:
                     b = best[j + 1]
                     old += dist[best[j]].get(b, INF)
                     new += dist[best[i]].get(b, INF)
-                if new - old < 0:
+                if new - old < -eps:
                     best = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
                     cur_len += new - old
                     improved = True
@@ -238,8 +361,9 @@ def _optimize_order(ess: List[int], G) -> List[int]:
     return best
 
 
-def improve_walk(walk: List[int], G, rounds: int = 4) -> List[int]:
-    """Monotone-safe shortening: essential extraction -> shortest-path
+def improve_walk(walk: List[int], G, rounds: int = 4,
+                 weight: Optional[str] = None) -> List[int]:
+    """Monotone-safe shortening: essential extraction -> minimum-cost
     rerouting -> redundancy removal, iterated. Output covers G and is never
     longer than the input; otherwise the input is returned."""
     if not walk:
@@ -268,7 +392,7 @@ def improve_walk(walk: List[int], G, rounds: int = 4) -> List[int]:
             if a == b:
                 continue
             try:
-                sp = nx.shortest_path(G, a, b)
+                sp = _one_path(G, a, b, weight)
             except nx.NetworkXNoPath:
                 ok = False
                 break
@@ -283,24 +407,57 @@ def improve_walk(walk: List[int], G, rounds: int = 4) -> List[int]:
     return best
 
 
-def improve_walk_strong(walk: List[int], G, rounds: int = 4) -> List[int]:
-    """``improve_walk`` plus 2-opt/Or-opt over the essential-vertex order.
-    Monotone-safe like ``improve_walk``. This is the main quality lever of the
-    pipeline (measured ~-7.6% walk cost in the source project)."""
+def improve_walk_strong(walk: List[int], G, rounds: int = 4,
+                        objective: str = "length",
+                        region_size: Optional[int] = None,
+                        weight: Optional[str] = None) -> List[int]:
+    """``improve_walk`` plus 2-opt/Or-opt over the essential-vertex order and a
+    distinct-maximizing re-stitch. Monotone-safe like ``improve_walk``: the
+    result is valid, covering, and never worse than the input under the chosen
+    ranking (Theorem 3 in docs/proofs.md).
+
+    ``objective="length"`` (default) minimizes the walk length and uses the
+    exact CNOT cost only to break ties, so the output is never *longer* than
+    the input. ``objective="cnot"`` minimizes ``2*whites + 3*moves`` directly:
+    it may return a slightly longer walk that visits more distinct vertices and
+    is therefore strictly cheaper (Lemma 3.1). ``objective="fidelity"``
+    minimizes the weighted account of section 5 and routes in the weighted
+    metric, steering the walk away from bad couplings."""
     if not walk:
         return walk
     full = set(G.nodes())
     if not (full <= coverage(walk, G)):
         return walk
-    base = improve_walk(walk, G, rounds=rounds)
+    if objective == "fidelity" and weight is None:
+        weight = EDGE_WEIGHT
+
+    def key(w):
+        return _walk_key(w, G, objective, region_size, weight)
+
+    base = improve_walk(walk, G, rounds=rounds, weight=weight)
+    if objective != "length" and key(walk) < key(base):
+        base = list(walk)
+
+    # Free win: re-stitch the current essentials so that segments pick up as
+    # many new vertices as possible. Same cost of the stitch (Lemma 3.4),
+    # never fewer distinct vertices, hence never a worse total.
     ess = _essential_seq(base, G)
+    rich = _expand_order_rich(ess, G, weight) if ess else None
+    if rich is not None:
+        rich = _redundancy_removal(rich, G, full)
+        if (full <= coverage(rich, G)) and key(rich) < key(base):
+            base = rich
+
     if len(ess) >= 4:
-        new_ord = _optimize_order(ess, G)
-        cand = _expand_order(new_ord, G)
-        if cand is not None:
+        new_ord = _optimize_order(ess, G, weight)
+        for stitch in (_expand_order_rich, _expand_order):
+            cand = stitch(new_ord, G, weight)
+            if cand is None:
+                continue
             cand = _redundancy_removal(cand, G, full)
-            if (full <= coverage(cand, G)) and len(cand) < len(base):
-                base = improve_walk(cand, G, rounds=rounds)
+            if (full <= coverage(cand, G)) and key(cand) < key(base):
+                polished = improve_walk(cand, G, rounds=rounds, weight=weight)
+                base = polished if key(polished) < key(cand) else cand
     return base
 
 
@@ -344,40 +501,50 @@ def _greedy_cost_dom(G, dist, nbr, full, lam: float, first=None) -> List[int]:
     return dom
 
 
-def dominating_walk(G, lam_grid=(0.0, 0.5, 1.0), restarts: int = 4) -> Optional[List[int]]:
+def dominating_walk(G, lam_grid=(0.0, 0.5, 1.0), restarts: int = 4,
+                    objective: str = "length",
+                    weight: Optional[str] = None) -> Optional[List[int]]:
     """Model-free dominating walk: cost-aware greedy dominating set (grid over
     the distance penalty ``lam``, multi-restart over the initial hub), ordered
-    by the 2-opt/Or-opt tour optimizer, stitched with shortest paths, then
-    redundancy-cleaned. Returns the shortest covering walk found or None."""
+    by the 2-opt/Or-opt tour optimizer, stitched with shortest paths chosen to
+    maximize distinct vertices, then redundancy-cleaned. Returns the best
+    covering walk found under ``objective`` (see :func:`improve_walk_strong`),
+    or None."""
     full = set(G.nodes())
     if len(full) <= 1:
         return list(full)
-    dist = dict(nx.all_pairs_shortest_path_length(G))
+    if objective == "fidelity" and weight is None:
+        weight = EDGE_WEIGHT
+    dist = {s: _dist_from(G, s, weight) for s in G.nodes()}
     nbr = {v: ({v} | set(G.neighbors(v))) for v in G.nodes()}
     deg_order = sorted(G.nodes(), key=lambda v: -len(nbr[v]))
     firsts = [None] + deg_order[: max(0, restarts - 1)]
     best_walk = None
+    best_key = None
     for lam in lam_grid:
         for first in firsts:
             dom = _greedy_cost_dom(G, dist, nbr, full, lam, first=first)
             if not dom:
                 continue
-            order = _optimize_order(dom, G) if len(dom) >= 4 else dom
-            w = _expand_order(order, G)
-            if w is None:
-                continue
-            w = _redundancy_removal(w, G, full)
-            if (full <= coverage(w, G)) and (
-                best_walk is None or len(w) < len(best_walk)
-            ):
-                best_walk = w
+            order = _optimize_order(dom, G, weight) if len(dom) >= 4 else dom
+            for stitch in (_expand_order_rich, _expand_order):
+                w = stitch(order, G, weight)
+                if w is None:
+                    continue
+                w = _redundancy_removal(w, G, full)
+                if not (full <= coverage(w, G)):
+                    continue
+                kw = _walk_key(w, G, objective, weight=weight)
+                if best_key is None or kw < best_key:
+                    best_walk, best_key = w, kw
     return best_walk
 
 
 # -- warm-start repair -------------------------------------------------------
 
 
-def repair_walk(walk: List[int], G: nx.Graph) -> Optional[List[int]]:
+def repair_walk(walk: List[int], G: nx.Graph, objective: str = "length",
+                weight: Optional[str] = None) -> Optional[List[int]]:
     """Adapt a walk to a graph that lost some vertices (full-QFT cascades
     remove one qubit per cascade): drop missing vertices from the essential
     order, restitch with shortest paths in the new graph, complete coverage if
@@ -388,12 +555,14 @@ def repair_walk(walk: List[int], G: nx.Graph) -> Optional[List[int]]:
     present = [v for v in walk if G.has_node(v)]
     if not present:
         return None
+    if objective == "fidelity" and weight is None:
+        weight = EDGE_WEIGHT
     ess = _essential_seq(present, G)  # order survives; gaps restitched below
-    cand = _expand_order(ess, G)
+    cand = _expand_order(ess, G, weight)
     if cand is None:
         return None
     cand = complete_walk(cand, G)
     full = set(G.nodes())
     if not (full <= coverage(cand, G)):
         return None
-    return improve_walk_strong(cand, G)
+    return improve_walk_strong(cand, G, objective=objective, weight=weight)

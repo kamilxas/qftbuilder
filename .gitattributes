@@ -1,0 +1,11 @@
+# Normalize line endings: the repo stores LF, checkouts get the platform's
+# native ending. Without this the tree mixed CRLF and LF file by file, which
+# showed up as spurious diffs against the published snapshot.
+* text=auto eol=lf
+
+# Never touch binaries
+*.pt   binary
+*.png  binary
+*.pdf  binary
+*.gz   binary
+*.zip  binary

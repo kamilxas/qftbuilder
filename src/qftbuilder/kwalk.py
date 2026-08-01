@@ -67,7 +67,7 @@ Theta(n^3)-scale):
    (:func:`qftbuilder.milp.shortest_budgeted_walk_milp`), whose LP/B&B dual
    proves optimality without enumerating states.
 
-3. **Exactness за budget.** Answers absorbed from *fully explored* BFS
+3. **Exactness against the budget.** Answers absorbed from *fully explored* BFS
    levels are provably optimal (BFS by length). If the budget trips
    mid-level, the search downgrades honestly: a coverage-greedy beam tail
    (width ``max(4096, 64 n)``, insertion budget ``B/4``) continues for
@@ -100,11 +100,12 @@ enumeration.
 from __future__ import annotations
 
 import heapq
+import time
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import networkx as nx
 
-from .cost import cnot_upper_bound, walk_cost
+from .cost import cnot_upper_bound, walk_cost, weighted_sweep_cost
 
 __all__ = ["budgeted_walk", "budgeted_sweep", "max_coverage_walk"]
 
@@ -129,6 +130,24 @@ _MAX_DEPTH_FACTOR = 2           # a dominating walk needs < ~2n vertices
 # Delta cancels out of the work bound by construction: denser graphs get a
 # smaller state budget, and k never enters (one budget serves every k).
 _BUDGET_NUM = (WORK_FACTOR * 4 * 64) // 5   # = 1382
+
+# Pareto pruning: closed states remembered per last vertex. The check is
+# O(PARETO_KEEP) big-int ANDs per generated state; checking a subset of the
+# stored states is sound (docs/proofs.md, Remark 4.4), so this trades pruning
+# power against a bounded constant, never correctness. Measured: it pays only
+# where coverage saturates (k near n, where many distinct visited-sets share a
+# coverage) and costs ~2x elsewhere -- hence the probe below switches it off
+# on instances where it is not earning its keep.
+PARETO_KEEP = 8
+PARETO_PROBE = 20_000       # generated states before judging the prune rate
+PARETO_MIN_RATE = 0.02      # keep pruning only above this hit rate
+
+# Automorphism-orbit reduction of the start states (Lemma 4.5). Both caps make
+# the enumeration cut off early; a partial automorphism set only refines the
+# orbits, so the reduction stays sound either way.
+ORBIT_CAP_MAPS = 64
+ORBIT_CAP_SECS = 1.0
+ORBIT_MIN_N = 12            # below this the search is trivial anyway
 
 
 def _budgets(n: int, max_deg: int, state_budget: Optional[int],
@@ -162,6 +181,48 @@ def _prepare(G: nx.Graph):
     return nodes, idx, adj, nbmask
 
 
+def _orbit_reps(G: nx.Graph, idx, cap_maps: int = ORBIT_CAP_MAPS,
+                cap_secs: float = ORBIT_CAP_SECS) -> List[int]:
+    """One start-vertex index per orbit of a *subset* of ``Aut(G)``.
+
+    Only the starts need reducing: by Lemma 4.5 (docs/proofs.md) an optimal
+    walk starting anywhere maps, under an automorphism, to an equally long
+    optimal walk starting at the orbit representative. Enumerating only part
+    of ``Aut(G)`` merely *refines* the orbits, so a cut-off search stays sound
+    -- it only forfeits reduction. On failure this returns every vertex, i.e.
+    the unreduced search.
+
+    Measured cost: 0.03-0.16 s up to n=144, against 2.0x (heavy-hex) to 6.9x
+    (square lattice) fewer start states."""
+    n = len(idx)
+    try:
+        from networkx.algorithms.isomorphism import GraphMatcher
+    except Exception:                      # pragma: no cover - networkx always has it
+        return list(range(n))
+    par = list(range(n))
+
+    def find(x: int) -> int:
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+
+    t0 = time.perf_counter()
+    seen = 0
+    try:
+        for mapping in GraphMatcher(G, G).isomorphisms_iter():
+            seen += 1
+            for u, v in mapping.items():
+                a, b = find(idx[u]), find(idx[v])
+                if a != b:
+                    par[a] = b
+            if seen >= cap_maps or time.perf_counter() - t0 > cap_secs:
+                break
+    except Exception:                      # pragma: no cover - defensive
+        return list(range(n))
+    return sorted({find(i) for i in range(n)})
+
+
 def _reconstruct(parent, key) -> List[int]:
     seq = []
     while key is not None:
@@ -171,24 +232,34 @@ def _reconstruct(parent, key) -> List[int]:
     return seq
 
 
-def _fill_region(walk_idx: List[int], cov: int, k: int, n: int) -> List[int]:
-    """Region = black (walk) vertices + lowest-index white fillers."""
+def _fill_region(walk_idx: List[int], cov: int, k: int, n: int,
+                 white_cost: Optional[List[float]] = None) -> List[int]:
+    """Region = black (walk) vertices + white fillers.
+
+    Any ``k - |blacks|`` covered vertices form a valid region, so the choice is
+    free; ``white_cost[i]`` (cheapest edge from ``i`` to a black neighbour)
+    makes it *cheapest-first*, which is optimal for the white term of the
+    weighted account since the per-white costs are independent
+    (docs/proofs.md, Proposition 5.2). Without weights it keeps the previous
+    lowest-index order."""
     S = sorted(set(walk_idx))
     if len(S) >= k:
         return S[:k]  # cannot happen for optimal walks; defensive
     have = set(S)
-    for i in range(n):
+    whites = [i for i in range(n) if (cov >> i) & 1 and i not in have]
+    if white_cost is not None:
+        whites.sort(key=lambda i: white_cost[i])
+    for i in whites:
         if len(S) == k:
             break
-        if (cov >> i) & 1 and i not in have:
-            S.append(i)
-            have.add(i)
+        S.append(i)
     return sorted(S)
 
 
-def _result(nodes, walk_idx, cov, k, n, proven, method) -> Dict:
+def _result(nodes, walk_idx, cov, k, n, proven, method,
+            white_cost: Optional[List[float]] = None) -> Dict:
     walk = [nodes[i] for i in walk_idx]
-    S_idx = _fill_region(walk_idx, cov, k, n)
+    S_idx = _fill_region(walk_idx, cov, k, n, white_cost)
     subset = [nodes[i] for i in S_idx]
     return {
         "k": k,
@@ -200,6 +271,23 @@ def _result(nodes, walk_idx, cov, k, n, proven, method) -> Dict:
         "region_proven": bool(proven),
         "method": method,
     }
+
+
+def _white_costs(G, nodes, idx, walk_idx, weight: str) -> List[float]:
+    """For every vertex, the cheapest edge to a black (walk) vertex; infinite
+    when it has none. Used to pick the cheapest whites into the region."""
+    blacks = {nodes[i] for i in walk_idx}
+    out = [float("inf")] * len(nodes)
+    for v in G.nodes():
+        best = None
+        for u in G.neighbors(v):
+            if u in blacks:
+                w = float(G[u][v].get(weight, 1.0))
+                if best is None or w < best:
+                    best = w
+        if best is not None:
+            out[idx[v]] = best
+    return out
 
 
 def _subwalk_answers(walk_idx: List[int], nbmask, ks: Sequence[int]):
@@ -229,35 +317,65 @@ def _subwalk_answers(walk_idx: List[int], nbmask, ks: Sequence[int]):
     return best
 
 
-def _astar_budgeted(prep, k: int, budget: int):
+def _move_costs(G, nodes, idx, adj, weight: str) -> Tuple[List[List[float]], float]:
+    """Per-move costs parallel to ``adj``, plus the cheapest move."""
+    wadj = [[float(G[nodes[i]][nodes[j]].get(weight, 1.0)) for j in adj[i]]
+            for i in range(len(nodes))]
+    wmin = min((w for row in wadj for w in row), default=1.0)
+    return wadj, wmin
+
+
+def _astar_budgeted(prep, k: int, budget: int, pareto_keep: Optional[int] = None,
+                    starts: Optional[Sequence[int]] = None,
+                    wadj: Optional[List[List[float]]] = None,
+                    wmin: float = 1.0):
     """A* for the shortest walk with ``|N[V(W)]| >= k`` (single k). The
     admissible, consistent heuristic ``h = ceil((k - coverage)/Delta)`` (each
     step adds at most Delta new covered vertices) makes the first popped goal
-    optimal; consistency is proved in the module notes, and the optima match
-    the level-BFS bit-for-bit on the test suite. Returns ``(walk_idx, cov)``
-    (proven optimal) or ``None`` if the closed set would exceed ``budget``
-    (caller falls back to the level BFS)."""
+    optimal; consistency is proved in the module notes. Returns
+    ``(walk_idx, cov)`` (proven optimal) or ``None`` if the closed set would
+    exceed ``budget`` (caller falls back to the level BFS).
+
+    Two state-space reductions, both proved in docs/proofs.md section 4:
+
+    * states are keyed by ``(last, cov)`` rather than ``(last, visited)`` --
+      coverage is a sufficient statistic for both the successor function and
+      the goal test (Lemma 4.1), so this merges states and never splits them;
+    * a generated state dominated by an already-closed state at the same last
+      vertex (``cov`` a subset, ``g`` no larger) is discarded (Lemma 4.3).
+      Only ``pareto_keep`` closed states per vertex are checked, which is
+      sound by Remark 4.4 -- partial checking costs pruning power, not
+      correctness.
+    """
     nodes, idx, adj, nbmask = prep
     n = len(nodes)
     Delta = max((len(a) for a in adj), default=1)
+    if pareto_keep is None:
+        pareto_keep = PARETO_KEEP
 
-    def h(pc: int) -> int:
+    def h(pc: int):
         r = k - pc
-        return (r + Delta - 1) // Delta if r > 0 else 0  # ceil, integer
+        steps = (r + Delta - 1) // Delta if r > 0 else 0  # ceil, integer
+        # Under weights each of those steps still costs at least wmin, which
+        # keeps h admissible and consistent (docs/proofs.md, Lemma 5.4).
+        return steps * wmin if wadj is not None else steps
 
-    heap = []            # (f, g, last, vmask, cov)
+    g0 = 0.0 if wadj is not None else 1
+    heap = []            # (f, g, last, cov)
     g_score: Dict = {}
     parent: Dict = {}
-    for i in range(n):
-        st = (i, 1 << i)
-        g_score[st] = 1
+    dom: List[List] = [[] for _ in range(n)]   # last -> [(cov, g)] closed
+    for i in (range(n) if starts is None else starts):
+        st = (i, nbmask[i])
+        g_score[st] = g0
         parent[st] = None
-        heapq.heappush(heap, (1 + h(nbmask[i].bit_count()), 1, i, 1 << i, nbmask[i]))
+        heapq.heappush(heap, (g0 + h(nbmask[i].bit_count()), g0, i, nbmask[i]))
 
     closed = set()
+    gen = pruned = 0
     while heap:
-        f, g, last, vm, cov = heapq.heappop(heap)
-        st = (last, vm)
+        f, g, last, cov = heapq.heappop(heap)
+        st = (last, cov)
         if g > g_score.get(st, 1 << 30) or st in closed:
             continue  # stale duplicate / already finalized
         closed.add(st)
@@ -271,15 +389,34 @@ def _astar_budgeted(prep, k: int, budget: int):
                 cur = parent[cur]
             walk.reverse()
             return walk, cov
-        for u in adj[last]:
-            nst = (u, vm | (1 << u))
-            ng = g + 1
-            if ng < g_score.get(nst, 1 << 30):
-                ncov = cov | nbmask[u]
-                g_score[nst] = ng
-                parent[nst] = st
-                heapq.heappush(heap, (ng + h(ncov.bit_count()), ng, u,
-                                      vm | (1 << u), ncov))
+        if pareto_keep:
+            bucket = dom[last]
+            bucket.append((cov, g))
+            if len(bucket) > pareto_keep:
+                # evict the least useful dominator (smallest coverage)
+                worst = min(range(len(bucket)),
+                            key=lambda t: bucket[t][0].bit_count())
+                bucket.pop(worst)
+        row = wadj[last] if wadj is not None else None
+        for t, u in enumerate(adj[last]):
+            ng = g + (row[t] if row is not None else 1)
+            ncov = cov | nbmask[u]
+            nst = (u, ncov)
+            if ng >= g_score.get(nst, float("inf")):
+                continue
+            if pareto_keep:
+                gen += 1
+                if any(gg <= ng and not (ncov & ~c) for c, gg in dom[u]):
+                    pruned += 1
+                    continue  # Pareto-dominated by a closed state at u
+                if gen >= PARETO_PROBE and pruned < PARETO_MIN_RATE * gen:
+                    # The check is not paying for itself on this instance.
+                    # Switching it off only forfeits pruning power, never
+                    # correctness (docs/proofs.md, Remark 4.4).
+                    pareto_keep = 0
+            g_score[nst] = ng
+            parent[nst] = st
+            heapq.heappush(heap, (ng + h(ncov.bit_count()), ng, u, ncov))
     return None
 
 
@@ -290,6 +427,7 @@ def budgeted_walk(
     state_cap: Optional[int] = None,
     fallback: Union[str, List, None] = "auto",
     engine: str = "astar",
+    weight: Optional[str] = None,
 ) -> Dict:
     """Shortest walk whose closed neighbourhood covers at least ``k`` vertices
     (equivalently: the optimal sub-QFT region of size ``k`` plus its optimal
@@ -302,19 +440,60 @@ def budgeted_walk(
     or ``engine="bfs"`` it falls back to the level-BFS sweep machinery (beam
     tail + subwalk fallback).
 
+    ``weight`` names an edge attribute of per-CNOT costs (see
+    :func:`qftbuilder.graphs.with_edge_errors`). With it the search minimizes
+    the *weighted* move cost instead of the length -- the region then forms
+    around good couplings and the white fillers are the cheapest to collect
+    (docs/proofs.md, Lemma 5.4 and Proposition 5.2). Note ``k_path`` is then no
+    longer the quantity being minimized, and the orbit reduction is switched
+    off (an automorphism of the graph need not preserve the weights).
+
     Returns a dict with keys ``k, subset, walk, k_path, cost`` (Theorem-4
     bound), ``cost_sweep`` (exact one-sweep CNOTs, 2*whites + 3*moves),
-    ``region_proven`` and ``method`` (``"astar"`` / ``"bfs"`` / ``"subwalk"``).
+    ``region_proven`` and ``method`` (``"astar"`` / ``"astar-weighted"`` /
+    ``"bfs"`` / ``"subwalk"``).
     ``state_cap`` is a legacy alias (budget ``25*cap``)."""
     n = G.number_of_nodes()
     if engine == "astar" and 1 <= k <= n:
         prep = _prepare(G)
+        nodes, idx, adj, _ = prep
         max_deg = max((d for _, d in G.degree()), default=1)
         budget, _ = _budgets(n, max_deg, state_budget, state_cap)
-        res = _astar_budgeted(prep, k, budget)
-        if res is not None:
-            walk_idx, cov = res
-            return _result(prep[0], walk_idx, cov, k, n, True, "astar")
+        if weight is None:
+            starts = _orbit_reps(G, idx) if n >= ORBIT_MIN_N else None
+            res = _astar_budgeted(prep, k, budget, starts=starts)
+            if res is not None:
+                walk_idx, cov = res
+                return _result(nodes, walk_idx, cov, k, n, True, "astar")
+        else:
+            # The weighted A* minimizes the *move* term only, while the sweep
+            # also pays 2*w to collect each white; minimizing moves alone was
+            # measured to lose against the plain optimum on the total. So both
+            # candidates are generated and scored on the real objective, which
+            # makes the answer never worse than the unweighted one. Neither is
+            # a proof for the weighted total, hence region_proven=False.
+            # Orbit reduction is off here: an automorphism of G need not
+            # preserve the weights (docs/proofs.md, caveat after Lemma 4.5).
+            wadj, wmin = _move_costs(G, nodes, idx, adj, weight)
+            best = None
+            for method, res in (
+                ("astar", _astar_budgeted(prep, k, budget)),
+                ("astar-weighted",
+                 _astar_budgeted(prep, k, budget, wadj=wadj, wmin=wmin)),
+            ):
+                if res is None:
+                    continue
+                walk_idx, cov = res
+                wc = _white_costs(G, nodes, idx, walk_idx, weight)
+                r = _result(nodes, walk_idx, cov, k, n, False,
+                            "weighted-best/" + method, wc)
+                tot = weighted_sweep_cost(r["walk"], G, region=set(r["subset"]),
+                                          weight=weight)
+                if best is None or tot < best[0]:
+                    best = (tot, r)
+            if best is not None:
+                best[1]["cost_weighted"] = best[0]
+                return best[1]
         # over budget: fall through to the level-BFS path (beam + fallback)
     return budgeted_sweep(G, ks=[k], state_budget=state_budget,
                           state_cap=state_cap, fallback=fallback)[k]
@@ -350,11 +529,12 @@ def budgeted_sweep(
     pending = list(targets)
 
     parent: Dict = {}
-    frontier: Dict = {}  # key (last, vmask) -> cov
+    frontier: Dict = {}  # key (last, cov) -> cov  (Corollary 4.2)
     proven = True
 
-    for i in range(n):
-        key = (i, 1 << i)
+    starts = _orbit_reps(G, idx) if n >= ORBIT_MIN_N else range(n)
+    for i in starts:
+        key = (i, nbmask[i])
         parent[key] = None
         frontier[key] = nbmask[i]
 
@@ -380,13 +560,15 @@ def budgeted_sweep(
     def _expand(cur_frontier, insert_limit):
         """One BFS level. Returns (next_frontier, completed?)."""
         nxt: Dict = {}
-        for (last, vmask), cov in cur_frontier.items():
+        for key, cov in cur_frontier.items():
+            last = key[0]
             for u in adj[last]:
-                nkey = (u, vmask | (1 << u))
+                ncov = cov | nbmask[u]
+                nkey = (u, ncov)
                 if nkey in parent:
                     continue
-                parent[nkey] = (last, vmask)
-                nxt[nkey] = cov | nbmask[u]
+                parent[nkey] = key
+                nxt[nkey] = ncov
                 if len(parent) > insert_limit:
                     return nxt, False
         return nxt, True

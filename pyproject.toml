@@ -22,12 +22,16 @@ neural = ["torch>=2.0", "torch-geometric>=2.4"]
 quantum = ["qiskit>=1.0"]
 exact = ["ortools>=9.8"]
 all = ["qft-builder[neural,quantum,exact]"]
+dev = ["pytest>=7.4", "qft-builder[all]"]
 
 [project.urls]
-Repository = "https://github.com/kamilxas/qftbuilder"
+Repository = "https://github.com/kamilxas/qft-builder"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 qftbuilder = ["checkpoints/*.pt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -164,13 +164,19 @@ def single_sweep(
 
 def sub_qft(graph, k: int, state_budget: Optional[int] = None,
             state_cap: Optional[int] = None,
-            solver: Optional[Solver] = None) -> Dict:
+            solver: Optional[Solver] = None,
+            weight: Optional[str] = None) -> Dict:
     """Optimal size-``k`` sub-QFT region + walk via the budgeted-coverage
     search (:mod:`qftbuilder.kwalk`), in the caller's labels.
     ``state_cap=None`` uses the budgeted default, which guarantees the
     search never exceeds the whole-graph solve asymptotically (see the
     ``kwalk`` module docstring). ``k >= n`` delegates to the whole-graph
     cascade (``solver``, default balanced).
+
+    ``weight`` names an edge attribute of per-CNOT costs (see
+    :func:`qftbuilder.graphs.with_edge_errors`): the region then forms around
+    good couplings instead of merely being short. See the fidelity caveat in
+    :func:`qftbuilder.kwalk.budgeted_walk`.
 
     Returns the ``kwalk`` result dict plus ``whites/moves/cnot`` for one
     sweep over the region."""
@@ -186,13 +192,19 @@ def sub_qft(graph, k: int, state_budget: Optional[int] = None,
             "region_proven": False, "method": "solver",
             "whites": sw["whites"], "moves": sw["moves"], "cnot": sw["cnot"],
         }
-    r = budgeted_walk(G, k, state_budget=state_budget, state_cap=state_cap)
+    r = budgeted_walk(G, k, state_budget=state_budget, state_cap=state_cap,
+                      weight=weight)
     if r["walk"] is None:
         return r
     if not r["region_proven"]:
-        # beam-degraded search: polish the walk inside its region
+        # beam-degraded search (and always so under weights): polish the walk
+        # inside its region, under the same objective it was chosen by -- a
+        # length polish would undo the fidelity gain.
         sub = G.subgraph(r["subset"])
-        w = improve_walk_strong(r["walk"], sub)
+        w = improve_walk_strong(
+            r["walk"], sub,
+            objective="length" if weight is None else "fidelity",
+            weight=weight)
         if covers(sub, w):
             r["walk"], r["k_path"] = w, len(w)
     whites = k - len(set(r["walk"]))

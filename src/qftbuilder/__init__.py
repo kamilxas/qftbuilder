@@ -12,7 +12,15 @@ Five-line tour::
 
 See README for the method and the API table.
 """
-from .cost import cnot_hp_exact, cnot_upper_bound, sweep_cost, walk_cost
+from .cost import (
+    EDGE_WEIGHT,
+    cnot_hp_exact,
+    cnot_upper_bound,
+    error_to_weight,
+    sweep_cost,
+    walk_cost,
+    weighted_sweep_cost,
+)
 from .graphs import (
     as_graph,
     cycle,
@@ -23,6 +31,7 @@ from .graphs import (
     standard_benchmark,
     sun,
     sun_16q,
+    with_edge_errors,
 )
 from .kwalk import budgeted_sweep, budgeted_walk, max_coverage_walk
 from .qft import build_full_qft, naive_qft, single_sweep, sub_qft, transpiled_cx
@@ -79,6 +88,8 @@ __all__ = [
     "single_sweep", "build_full_qft", "transpiled_cx", "naive_qft",
     # cost model
     "cnot_upper_bound", "cnot_hp_exact", "sweep_cost", "walk_cost",
+    # fidelity-aware account
+    "EDGE_WEIGHT", "error_to_weight", "weighted_sweep_cost", "with_edge_errors",
     # graphs
     "as_graph", "lnn", "cycle", "sun", "sun_16q", "double_sun_27q",
     "heavy_hex", "square_lattice", "standard_benchmark",
